@@ -1,0 +1,174 @@
+import os
+import torch
+import numpy as np
+import pandas as pd
+import warnings
+from tqdm import tqdm
+from pymatgen.core import Structure
+from torch_geometric.data import Data
+from mendeleev import element
+from concurrent.futures import ProcessPoolExecutor
+
+DATA_DIR = "ENTER_DATA_DIR_HERE" # I used structures from Materials Project
+CSV_FILE = "ENTER_CSV_FILE_PATH_HERE" # Other MP data, e.g. Band Gap + Form
+OUT_DIR = "ENTER_OUTPUT_DIR_HERE"
+
+CUTOFF = 6.0
+MAX_NEIGHBORS = 12
+RBF_Count = 32
+NUM_WORKERS = os.cpu_count()
+
+os.makedirs(OUT_DIR, exist_ok=True)
+warnings.filterwarnings("ignore", module="pymatgen")
+
+class AtomFeaturizer:
+    def __init__(self, max_z=100):
+        self.descriptors = {}
+        for z in range(1, max_z + 1):
+            try:
+                el = element(z)
+                desc = [
+                    (el.atomic_weight or 0) / 100.0,
+                    (el.electronegativity_pauling or 2.0) / 4.0,
+                    (el.covalent_radius or 100.0) / 200.0,
+                    (el.melting_point or 0) / 1000.0,
+                    (el.group_id or 0) / 18.0
+                ]
+                self.descriptors[z] = torch.tensor(desc, dtype=torch.float)
+            except:
+                self.descriptors[z] = torch.zeros(5, dtype=torch.float)
+    
+    def get_feature(self, z):
+        return self.descriptors.get(z, torch.zeros(5, dtype=torch.float))
+
+atom_featurizer = AtomFeaturizer(max_z=118)
+
+def gaussian_rbf(dists, cutoff=6.0, n_rbf=32):
+    centers = torch.linspace(0.0, cutoff, n_rbf)
+    width = (cutoff / (n_rbf - 1))
+    gamma = 1.0 / (2 * width ** 2)
+    return torch.exp(-gamma * (dists.unsqueeze(-1) - centers) ** 2)
+
+def process_single_structure(row_data):
+    mp_id, band_gap, form_energy = row_data
+    cif_path = os.path.join(DATA_DIR, f"{mp_id}.cif")
+    out_path = os.path.join(OUT_DIR, f"{mp_id}.pt")
+
+    if os.path.exists(out_path):
+        return "skipped"
+
+    try:
+        struct = Structure.from_file(cif_path)
+        
+        if not struct.is_ordered:
+            return "disordered"
+
+        atom_features = []
+        atomic_numbers = []
+        
+        for site in struct.sites:
+            z = site.specie.Z
+            atomic_numbers.append(z)
+            desc = atom_featurizer.get_feature(z)
+            atom_features.append(desc)
+            
+        x_desc = torch.stack(atom_features)
+        x_z = torch.tensor(atomic_numbers, dtype=torch.long).unsqueeze(1)
+        x = torch.cat([x_z, x_desc], dim=1)
+
+        all_neighbors = struct.get_all_neighbors(CUTOFF, include_index=True)
+        
+        edge_indices = []
+        edge_attrs_list = []
+
+        for i, neighbors in enumerate(all_neighbors):
+            neighbors = sorted(neighbors, key=lambda x: x[1])[:MAX_NEIGHBORS]
+            site_i_coords = struct.sites[i].coords
+            
+            for neigh in neighbors:
+                neighbor_site = neigh[0]
+                d_ij = neigh[1]
+                j = neigh[2]
+                
+                rbf = gaussian_rbf(torch.tensor([d_ij]), CUTOFF, RBF_Count).squeeze(0)
+                
+                angles = []
+                vec_ij = neighbor_site.coords - site_i_coords
+                
+                for other_neigh in neighbors:
+                    k = other_neigh[2]
+                    if k == j: continue
+                    
+                    vec_ik = other_neigh[0].coords - site_i_coords
+                    norm_ij = np.linalg.norm(vec_ij)
+                    norm_ik = np.linalg.norm(vec_ik)
+                    
+                    if norm_ij < 1e-6 or norm_ik < 1e-6:
+                        cos_angle = 0.0
+                    else:
+                        cos_angle = np.dot(vec_ij, vec_ik) / (norm_ij * norm_ik)
+                    
+                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                    angles.append(np.arccos(cos_angle))
+                
+                if not angles:
+                    angle_stats = torch.zeros(4)
+                else:
+                    ang_tensor = torch.tensor(angles)
+                    angle_stats = torch.tensor([
+                        ang_tensor.mean(),
+                        ang_tensor.std(unbiased=False) if len(angles) > 1 else 0.0,
+                        ang_tensor.min(),
+                        ang_tensor.max()
+                    ])
+
+                edge_attr = torch.cat([rbf, angle_stats])
+                
+                edge_indices.append([i, j])
+                edge_attrs_list.append(edge_attr)
+
+        if not edge_indices:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, RBF_Count + 4), dtype=torch.float)
+        else:
+            edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+            edge_attr = torch.stack(edge_attrs_list)
+
+        y = torch.tensor([float(band_gap), float(form_energy)], dtype=torch.float).view(1, -1)
+
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        torch.save(data, out_path)
+        return "success"
+
+    except Exception as e:
+        return f"error: {str(e)}"
+
+def main():
+    if not os.path.exists(CSV_FILE):
+        print(f"Error: {CSV_FILE} not found.")
+        return
+
+    df = pd.read_csv(CSV_FILE)
+    tasks = list(zip(df["material_id"], df["band_gap"], df["formation_energy_per_atom"]))
+    
+    results = {"success": 0, "skipped": 0, "disordered": 0, "errors": 0}
+    
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        for res in tqdm(executor.map(process_single_structure, tasks), total=len(tasks)):
+            if res == "success":
+                results["success"] += 1
+            elif res == "skipped":
+                results["skipped"] += 1
+            elif res == "disordered":
+                results["disordered"] += 1
+            else:
+                results["errors"] += 1
+
+    print(f"Total Processed: {len(tasks)}")
+    print(f"Successfully Created: {results['success']}")
+    print(f"Already Existed: {results['skipped']}")
+    print(f"Skipped (Disordered): {results['disordered']}")
+    print(f"Failed (Errors): {results['errors']}")
+
+if __name__ == "__main__":
+    main()
