@@ -1,0 +1,1149 @@
+import os
+import glob
+import time
+import math
+import random
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+import json
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import random_split
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Dataset
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import scatter
+
+R2_CONFIG = {
+    "account_id": "ENTER_R2_ACCOUNT_ID_HERE",
+    "access_key": "ENTER_R2_ACCESS_KEY_HERE",
+    "secret_key": "ENTER_R2_SECRET_KEY_HERE",
+    "bucket_name": "ENTER_R2_BUCKET_NAME_HERE",
+    "public_url": "ENTER_R2_PUBLIC_URL_HERE"
+}
+
+CONFIG = {
+    "data_dir": "/workspace/data/graphs_processed",
+    "out_dir": "training_runs_novel",
+    "experiment_name": f"PaiNN_Novel_Architecture_{datetime.now().strftime('%Y%m%d_%H%M')}",
+    "epochs": 150,
+    "batch_size": 16,
+    "learning_rate": 2e-4,
+    "weight_decay": 2e-4,
+    "num_workers": 8,
+    "seed": 42,
+    "dim": 1024,
+    "n_interactions": 8,
+    "cutoff": 5.0,
+    "use_geometric_attention": True,
+    "use_multiscale_conv": True,
+    "use_adaptive_edge_gating": True,
+    "use_hierarchical_pooling": False,
+    "multiscale_radii": [3.0, 5.0, 7.0],
+    "gradient_accumulation_steps": 8,
+    "stochastic_depth_prob": 0.2,
+    "use_lookahead": True,
+    "lookahead_k": 10,
+    "lookahead_alpha": 0.5,
+    "upload_to_r2": True,
+    "upload_best_model": True,
+    "upload_final_model": True,
+    "upload_training_history": True,
+    "upload_config": True,
+}
+
+torch.manual_seed(CONFIG["seed"])
+np.random.seed(CONFIG["seed"])
+random.seed(CONFIG["seed"])
+
+class R2StorageManager:
+    def __init__(self, config=R2_CONFIG):
+        self.config = config
+        self.s3_client = None
+        self._initialize_client()
+        
+    def _initialize_client(self):
+        try:
+            self.s3_client = boto3.client(
+                's3',
+                endpoint_url=f'https://{self.config["account_id"]}.r2.cloudflarestorage.com',
+                aws_access_key_id=self.config["access_key"],
+                aws_secret_access_key=self.config["secret_key"],
+                config=Config(
+                    signature_version='s3v4',
+                    s3={'addressing_style': 'virtual'},
+                )
+            )
+            response = self.s3_client.list_buckets()
+            print(f"Connected to R2 Storage. Available buckets: {[b['Name'] for b in response['Buckets']]}")
+        except Exception as e:
+            print(f"Failed to initialize R2 client: {e}")
+            self.s3_client = None
+    
+    def is_connected(self):
+        return self.s3_client is not None
+    
+    def upload_file(self, local_path, r2_path, metadata=None):
+        if not self.is_connected():
+            print(f"R2 not connected. Skipping upload of {local_path}")
+            return False
+        
+        try:
+            extra_args = {}
+            if metadata:
+                extra_args['Metadata'] = metadata
+            
+            with open(local_path, 'rb') as f:
+                self.s3_client.put_object(
+                    Bucket=self.config["bucket_name"],
+                    Key=r2_path,
+                    Body=f,
+                    **extra_args
+                )
+            
+            file_size = os.path.getsize(local_path) / (1024 * 1024)
+            print(f"Uploaded {local_path} to R2: {r2_path} ({file_size:.2f} MB)")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to upload {local_path} to R2: {e}")
+            return False
+    
+    def upload_bytes(self, data_bytes, r2_path, metadata=None):
+        if not self.is_connected():
+            print(f"R2 not connected. Skipping upload to {r2_path}")
+            return False
+        
+        try:
+            extra_args = {}
+            if metadata:
+                extra_args['Metadata'] = metadata
+            
+            self.s3_client.put_object(
+                Bucket=self.config["bucket_name"],
+                Key=r2_path,
+                Body=data_bytes,
+                **extra_args
+            )
+            
+            size_mb = len(data_bytes) / (1024 * 1024)
+            print(f"Uploaded bytes to R2: {r2_path} ({size_mb:.2f} MB)")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to upload bytes to R2: {e}")
+            return False
+    
+    def generate_public_url(self, r2_path, expiration=3600):
+        if not self.is_connected():
+            return None
+        
+        try:
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': self.config["bucket_name"],
+                    'Key': r2_path
+                },
+                ExpiresIn=expiration
+            )
+            return url
+        except Exception as e:
+            print(f"Failed to generate public URL: {e}")
+            return None
+    
+    def list_files(self, prefix=""):
+        if not self.is_connected():
+            return []
+        
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.config["bucket_name"],
+                Prefix=prefix
+            )
+            return [obj['Key'] for obj in response.get('Contents', [])]
+        except Exception as e:
+            print(f"Failed to list files: {e}")
+            return []
+
+r2_manager = R2StorageManager()
+
+class CrystalDataset(Dataset):
+    def __init__(self, root, transform=None, pre_transform=None):
+        self.file_list = glob.glob(os.path.join(root, "*.pt"))
+        super().__init__(root, transform, pre_transform)
+        
+    def len(self):
+        return len(self.file_list)
+
+    def get(self, idx):
+        data = torch.load(self.file_list[idx], weights_only=False)
+        return data
+
+class Lookahead(optim.Optimizer):
+    def __init__(self, optimizer, k=5, alpha=0.5):
+        self.optimizer = optimizer
+        self.k = k
+        self.alpha = alpha
+        self.param_groups = self.optimizer.param_groups
+        self.state = self.optimizer.state
+        
+        self.slow_state = {}
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    self.slow_state[p] = p.data.clone()
+        
+        self.step_counter = 0
+    
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
+        self.step_counter += 1
+        
+        if self.step_counter % self.k == 0:
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.requires_grad:
+                        slow = self.slow_state[p]
+                        slow.add_(p.data - slow, alpha=self.alpha)
+                        p.data.copy_(slow)
+        
+        return loss
+    
+    def zero_grad(self, set_to_none=False):
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+    
+    def state_dict(self):
+        return {
+            'optimizer': self.optimizer.state_dict(),
+            'slow_state': self.slow_state,
+            'step_counter': self.step_counter
+        }
+    
+    def load_state_dict(self, state_dict):
+        self.optimizer.load_state_dict(state_dict['optimizer'])
+        self.slow_state = state_dict['slow_state']
+        self.step_counter = state_dict['step_counter']
+
+class GeometricAttention(nn.Module):
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        self.geom_bias = nn.Sequential(
+            nn.Linear(3, dim),
+            nn.SiLU(),
+            nn.Linear(dim, num_heads)
+        )
+        
+        self.out_proj = nn.Linear(dim, dim)
+        
+    def forward(self, x, edge_index, pos):
+        N = x.size(0)
+        
+        q = self.q_proj(x).view(N, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(N, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(N, self.num_heads, self.head_dim)
+        
+        src, dst = edge_index
+        edge_vec = pos[dst] - pos[src]
+        edge_dist = torch.norm(edge_vec, dim=-1, keepdim=True).clamp(min=1e-6)
+        edge_dir = edge_vec / edge_dist
+        
+        geom_bias = self.geom_bias(edge_dir)
+        
+        q_src = q[src]
+        k_dst = k[dst]
+        
+        attn_scores = (q_src * k_dst).sum(dim=-1)
+        attn_scores = attn_scores / math.sqrt(self.head_dim)
+        
+        attn_scores = attn_scores + geom_bias
+        
+        attn_weights = torch.zeros_like(attn_scores)
+        for h in range(self.num_heads):
+            max_score = scatter(attn_scores[:, h], dst, dim=0, reduce='max')[dst]
+            exp_scores = torch.exp(attn_scores[:, h] - max_score)
+            sum_exp = scatter(exp_scores, dst, dim=0, reduce='sum')[dst]
+            attn_weights[:, h] = exp_scores / (sum_exp + 1e-8)
+        
+        v_src = v[src]
+        weighted_v = v_src * attn_weights.unsqueeze(-1)
+        
+        out = scatter(weighted_v.view(-1, self.dim), dst, dim=0, reduce='sum', dim_size=N)
+        
+        return self.out_proj(out)
+
+class AdaptiveEdgeGating(nn.Module):
+    def __init__(self, dim, edge_dim):
+        super().__init__()
+        
+        self.gate_net = nn.Sequential(
+            nn.Linear(dim * 2 + edge_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 1),
+            nn.Sigmoid()
+        )
+        
+        self.context_net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, x, edge_index, edge_attr):
+        src, dst = edge_index
+        
+        edge_input = torch.cat([
+            x[src],
+            x[dst],
+            edge_attr
+        ], dim=-1)
+        
+        gate_weights = self.gate_net(edge_input)
+        
+        return gate_weights
+
+class MultiScaleConv(MessagePassing):
+    def __init__(self, dim, edge_dim, scales=[3.0, 5.0, 7.0]):
+        super().__init__(aggr="add")
+        self.dim = dim
+        self.scales = scales
+        self.num_scales = len(scales)
+        
+        self.scale_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(edge_dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            ) for _ in scales
+        ])
+        
+        self.message_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            ) for _ in scales
+        ])
+        
+        self.scale_combiner = nn.Sequential(
+            nn.Linear(dim * self.num_scales, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, x, edge_index, edge_attr, edge_distances):
+        scale_outputs = []
+        
+        for i, (scale, scale_net, msg_net) in enumerate(zip(
+            self.scales, self.scale_nets, self.message_nets
+        )):
+            scale_mask = torch.exp(-((edge_distances - scale) ** 2) / (2 * (scale * 0.3) ** 2))
+            scale_mask = scale_mask.unsqueeze(-1)
+            
+            edge_feat = scale_net(edge_attr) * scale_mask
+            
+            msg = msg_net(x)
+            out = self.propagate(edge_index, x=msg, edge_feat=edge_feat)
+            scale_outputs.append(out)
+        
+        combined = torch.cat(scale_outputs, dim=-1)
+        output = self.scale_combiner(combined)
+        
+        return output
+    
+    def message(self, x_j, edge_feat):
+        return x_j * edge_feat
+
+class HierarchicalPooling(nn.Module):
+    def __init__(self, dim, num_levels=3):
+        super().__init__()
+        self.num_levels = num_levels
+        
+        self.pool_ratios = [0.5 ** (i + 1) for i in range(num_levels)]
+        
+        self.select_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, 1)
+            ) for _ in range(num_levels)
+        ])
+        
+        self.proj_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            ) for _ in range(num_levels)
+        ])
+        
+        self.combiner = nn.Sequential(
+            nn.Linear(dim * (num_levels + 1), dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, x, batch):
+        representations = [x]
+        
+        current_x = x
+        current_batch = batch
+        
+        for level in range(self.num_levels):
+            scores = self.select_nets[level](current_x).squeeze(-1)
+            
+            selected_indices = []
+            num_graphs = batch.max().item() + 1
+            
+            for g in range(num_graphs):
+                mask = (current_batch == g)
+                graph_scores = scores[mask]
+                graph_indices = torch.where(mask)[0]
+                
+                k = max(1, int(self.pool_ratios[level] * graph_scores.size(0)))
+                _, top_k = torch.topk(graph_scores, k)
+                selected_indices.append(graph_indices[top_k])
+            
+            selected_indices = torch.cat(selected_indices)
+            
+            current_x = current_x[selected_indices]
+            current_batch = current_batch[selected_indices]
+            
+            current_x = self.proj_nets[level](current_x)
+            
+            level_repr = scatter(current_x, current_batch, dim=0, reduce='mean',
+                               dim_size=num_graphs)
+            representations.append(level_repr)
+        
+        orig_repr = scatter(x, batch, dim=0, reduce='mean', dim_size=num_graphs)
+        representations[0] = orig_repr
+        
+        combined = torch.cat(representations, dim=-1)
+        
+        return self.combiner(combined)
+
+class EquivariantFeatureMixing(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        
+        self.s_to_s = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+        self.s_to_v = nn.Linear(dim, dim)
+        
+        self.v_to_s = nn.Linear(dim, dim)
+        
+        self.mixer = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, s, edge_index, pos):
+        src, dst = edge_index
+        
+        edge_vec = pos[dst] - pos[src]
+        edge_dist = torch.norm(edge_vec, dim=-1, keepdim=True).clamp(min=1e-6)
+        edge_dir = edge_vec / edge_dist
+        
+        v_weights = self.s_to_v(s[src])
+        
+        v = v_weights.unsqueeze(-1) * edge_dir.unsqueeze(1)
+        
+        v_agg = scatter(v, dst, dim=0, reduce='mean', dim_size=s.size(0))
+        
+        v_norm = torch.norm(v_agg, dim=-1)
+        v_scalar = self.v_to_s(v_norm)
+        
+        s_direct = self.s_to_s(s)
+        
+        mixed = self.mixer(torch.cat([s_direct, v_scalar], dim=-1))
+        
+        return mixed + s
+
+class NovelPaiNNMessage(MessagePassing):
+    def __init__(self, dim, edge_dim, config):
+        super().__init__(aggr="add", flow="source_to_target")
+        self.dim = dim
+        self.config = config
+        
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim * 3)
+        )
+        
+        self.scalar_message = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim * 3)
+        )
+        
+        if config["use_geometric_attention"]:
+            self.geom_attn = GeometricAttention(dim, num_heads=8)
+            
+        if config["use_adaptive_edge_gating"]:
+            self.edge_gate = AdaptiveEdgeGating(dim, edge_dim)
+            
+        if config["use_multiscale_conv"]:
+            self.multiscale = MultiScaleConv(dim, edge_dim, config["multiscale_radii"])
+        
+        update_input_dim = dim * 2
+        if config["use_geometric_attention"]:
+            update_input_dim += dim
+        if config["use_multiscale_conv"]:
+            update_input_dim += dim
+            
+        self.update_net = nn.Sequential(
+            nn.Linear(update_input_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, s, edge_index, edge_attr, pos, skip=False):
+        if skip:
+            return s
+        
+        s_msg = self.propagate(edge_index, s=s, edge_attr=edge_attr)
+        
+        update_features = [s, s_msg]
+        
+        if self.config["use_geometric_attention"]:
+            attn_out = self.geom_attn(s, edge_index, pos)
+            update_features.append(attn_out)
+            
+        if self.config["use_multiscale_conv"]:
+            src, dst = edge_index
+            edge_vec = pos[dst] - pos[src]
+            edge_dist = torch.norm(edge_vec, dim=-1)
+            
+            ms_out = self.multiscale(s, edge_index, edge_attr, edge_dist)
+            update_features.append(ms_out)
+        
+        combined = torch.cat(update_features, dim=-1)
+        s_new = s + self.update_net(combined)
+        
+        return s_new
+
+    def message(self, s_j, edge_attr, edge_index):
+        if self.config["use_adaptive_edge_gating"]:
+            gate_weights = self.edge_gate(s_j, edge_index, edge_attr)
+            edge_attr = edge_attr * gate_weights
+        
+        edge_weight = self.edge_encoder(edge_attr)
+        s_transform = self.scalar_message(s_j)
+        
+        msg = edge_weight * s_transform
+        msg_1, msg_2, msg_gate = torch.chunk(msg, 3, dim=-1)
+        
+        return msg_1 * torch.sigmoid(msg_gate) + msg_2
+
+class WeightedSumReadout(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 1)
+        )
+
+    def forward(self, x, batch):
+        attn_weights = self.attn_mlp(x)
+        
+        max_attn = scatter(attn_weights, batch, dim=0, reduce='max',
+                          dim_size=batch.max().item() + 1)[batch]
+        
+        attn_weights = torch.exp(attn_weights - max_attn)
+        norm_factor = scatter(attn_weights, batch, dim=0, reduce='sum',
+                             dim_size=batch.max().item() + 1)[batch]
+        
+        attn_weights = attn_weights / (norm_factor + 1e-8)
+        weighted_sum = x * attn_weights
+        
+        graph_repr = scatter(weighted_sum, batch, dim=0, reduce='sum')
+        
+        return graph_repr
+
+class NovelPaiNN_MultiTask(nn.Module):
+    def __init__(self, num_atom_types=119, dim=384, n_interactions=6,
+                 edge_dim=36, config=None):
+        super().__init__()
+        self.dim = dim
+        self.config = config or CONFIG
+        
+        self.atom_embedding = nn.Embedding(num_atom_types, dim)
+        self.node_feature_encoder = nn.Linear(5, dim)
+        
+        self.feature_combiner = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        
+        self.interactions = nn.ModuleList([
+            NovelPaiNNMessage(dim, edge_dim, self.config)
+            for _ in range(n_interactions)
+        ])
+        
+        if self.config.get("use_geometric_attention"):
+            self.equivariant_mixers = nn.ModuleList([
+                EquivariantFeatureMixing(dim) for _ in range(n_interactions)
+            ])
+        
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(dim) for _ in range(n_interactions)
+        ])
+        
+        if self.config.get("use_hierarchical_pooling"):
+            self.hierarchical_pool = HierarchicalPooling(dim, num_levels=3)
+        else:
+            self.readout_module = WeightedSumReadout(dim)
+
+        self.readout_gap = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim // 2),
+            nn.SiLU(),
+            nn.Linear(dim // 2, 1)
+        )
+        
+        self.readout_form = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim // 2),
+            nn.SiLU(),
+            nn.Linear(dim // 2, 1)
+        )
+
+    def forward(self, data):
+        z = data.x[:, 0].long()
+        node_features = data.x[:, 1:6].float()
+        edge_index = data.edge_index
+        edge_attr = data.edge_attr.float()
+        batch = data.batch
+        
+        if hasattr(data, 'pos') and data.pos is not None:
+            pos = data.pos
+        else:
+            pos = torch.zeros(z.size(0), 3, device=z.device)
+        
+        z_embed = self.atom_embedding(z)
+        feat_embed = self.node_feature_encoder(node_features)
+        
+        s = self.feature_combiner(torch.cat([z_embed, feat_embed], dim=-1))
+        
+        for i, (interaction, norm) in enumerate(zip(self.interactions, self.layer_norms)):
+            s_residual = s
+            
+            skip = self.training and (random.random() < self.config.get("stochastic_depth_prob", 0.0))
+            
+            s = interaction(s, edge_index, edge_attr, pos, skip=skip)
+            
+            if self.config.get("use_geometric_attention") and not skip:
+                s = self.equivariant_mixers[i](s, edge_index, pos)
+            
+            s = norm(s + s_residual)
+        
+        if self.config.get("use_hierarchical_pooling", True):
+            graph_repr = self.hierarchical_pool(s, batch)
+        else:
+            graph_repr = self.readout_module(s, batch)
+        
+        out_gap = self.readout_gap(graph_repr)
+        out_form = self.readout_form(graph_repr)
+        
+        return out_gap, out_form
+
+class MultiTaskLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.log_vars = nn.Parameter(torch.zeros(2))
+
+    def forward(self, pred_gap, target_gap, pred_form, target_form):
+        loss_gap = F.mse_loss(pred_gap, target_gap, reduction='mean')
+        loss_form = F.mse_loss(pred_form, target_form, reduction='mean')
+
+        log_vars_clamped = torch.clamp(self.log_vars, min=-10.0, max=10.0)
+
+        prec1 = torch.exp(-log_vars_clamped[0])
+        prec2 = torch.exp(-log_vars_clamped[1])
+
+        loss = (0.5 * (prec1 * loss_gap + log_vars_clamped[0]) +
+                0.5 * (prec2 * loss_form + log_vars_clamped[1]))
+
+        return loss, loss_gap, loss_form
+
+def upload_best_model_metadata(run_dir, epoch, performance_metrics, model_size_mb):
+    metadata = {
+        "experiment_name": CONFIG["experiment_name"],
+        "epoch": epoch,
+        "upload_timestamp": datetime.now().isoformat(),
+        "performance": performance_metrics,
+        "model_config": {
+            "dim": CONFIG["dim"],
+            "n_interactions": CONFIG["n_interactions"],
+            "use_geometric_attention": CONFIG["use_geometric_attention"],
+            "use_multiscale_conv": CONFIG["use_multiscale_conv"],
+            "use_adaptive_edge_gating": CONFIG["use_adaptive_edge_gating"],
+            "use_hierarchical_pooling": CONFIG["use_hierarchical_pooling"],
+        },
+        "training_config": {
+            "epochs": CONFIG["epochs"],
+            "batch_size": CONFIG["batch_size"],
+            "learning_rate": CONFIG["learning_rate"],
+            "weight_decay": CONFIG["weight_decay"],
+            "seed": CONFIG["seed"],
+        },
+        "file_info": {
+            "model_size_mb": model_size_mb,
+            "local_path": run_dir,
+        }
+    }
+    
+    metadata_path = os.path.join(run_dir, "best_model_metadata.json")
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    if CONFIG["upload_to_r2"] and CONFIG["upload_config"]:
+        r2_path = f"models/{CONFIG['experiment_name']}/best_model_metadata.json"
+        success = r2_manager.upload_file(metadata_path, r2_path, metadata={"type": "model_metadata"})
+        
+        if success:
+            public_url = r2_manager.generate_public_url(r2_path)
+            if public_url:
+                print(f"Metadata URL: {public_url}")
+    
+    return metadata
+
+def upload_to_r2_if_enabled(local_path, r2_subpath, metadata=None):
+    if CONFIG["upload_to_r2"]:
+        r2_path = f"models/{CONFIG['experiment_name']}/{r2_subpath}"
+        return r2_manager.upload_file(local_path, r2_path, metadata=metadata)
+    return False
+
+def evaluate_model(model, loader, criterion, device, dataset_len, name="Validation"):
+    model.eval()
+    loss_avg = 0
+    mae_gap = 0
+    mae_form = 0
+    
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            pred_gap, pred_form = model(batch)
+            
+            target_gap = batch.y[:, 0].unsqueeze(1)
+            target_form = batch.y[:, 1].unsqueeze(1)
+            
+            loss, _, _ = criterion(pred_gap, target_gap, pred_form, target_form)
+            loss_avg += loss.item()
+            
+            mae_gap += torch.abs(pred_gap - target_gap).sum().item()
+            mae_form += torch.abs(pred_form - target_form).sum().item()
+    
+    loss_avg /= len(loader)
+    mae_gap /= dataset_len
+    mae_form /= dataset_len
+    
+    print(f"   {name} | Loss: {loss_avg:.4f} | MAE: Gap {mae_gap:.4f}, Formation {mae_form:.4f}")
+
+    return loss_avg, mae_gap, mae_form
+
+def train_model():
+    run_dir = os.path.join(CONFIG["out_dir"], CONFIG["experiment_name"])
+    os.makedirs(run_dir, exist_ok=True)
+    log_file = os.path.join(run_dir, "training.log")
+    best_model_path = os.path.join(run_dir, "best_model.pt")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    if CONFIG["upload_to_r2"]:
+        if r2_manager.is_connected():
+            print("R2 Cloud Storage: Connected")
+        else:
+            print("R2 Cloud Storage: Not connected. Uploads will be skipped.")
+            CONFIG["upload_to_r2"] = False
+    
+    dataset = CrystalDataset(root=CONFIG["data_dir"])
+    print(f"Loaded {len(dataset)} crystal graphs")
+    
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(CONFIG["seed"])
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=True,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG["batch_size"] * 2,
+        shuffle=False,
+        num_workers=CONFIG["num_workers"]
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=CONFIG["batch_size"] * 2,
+        shuffle=False,
+        num_workers=CONFIG["num_workers"]
+    )
+    
+    model = NovelPaiNN_MultiTask(
+        dim=CONFIG["dim"],
+        n_interactions=CONFIG["n_interactions"],
+        config=CONFIG
+    ).to(device)
+    
+    criterion = MultiTaskLoss().to(device)
+    
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=CONFIG["learning_rate"],
+        weight_decay=CONFIG["weight_decay"]
+    )
+    
+    if CONFIG["use_lookahead"]:
+        optimizer = Lookahead(
+            optimizer,
+            k=CONFIG["lookahead_k"],
+            alpha=CONFIG["lookahead_alpha"]
+        )
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=10,
+    )
+    
+    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    
+    best_val_loss = float('inf')
+    best_epoch = 0
+    best_performance = {}
+    training_history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_mae_gap": [],
+        "val_mae_form": [],
+        "lr": []
+    }
+    
+    print("\nStarting training...")
+    for epoch in range(1, CONFIG["epochs"] + 1):
+        start_time = time.time()
+        model.train()
+        total_loss = 0
+        
+        optimizer.zero_grad(set_to_none=True)
+        
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']}")):
+            batch = batch.to(device, non_blocking=True)
+            
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
+                pred_gap, pred_form = model(batch)
+                target_gap = batch.y[:, 0].unsqueeze(1)
+                target_form = batch.y[:, 1].unsqueeze(1)
+                
+                loss, loss_gap, loss_form = criterion(
+                    pred_gap, target_gap, pred_form, target_form
+                )
+                
+                loss = loss / CONFIG["gradient_accumulation_steps"]
+            
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            if (batch_idx + 1) % CONFIG["gradient_accumulation_steps"] == 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            
+            total_loss += loss.item() * CONFIG["gradient_accumulation_steps"]
+        
+        val_loss, val_mae_gap, val_mae_form = evaluate_model(
+            model, val_loader, criterion, device, len(val_dataset), "Validation"
+        )
+        
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_performance = {
+                "val_loss": val_loss,
+                "val_mae_gap": val_mae_gap,
+                "val_mae_form": val_mae_form,
+                "epoch": epoch
+            }
+            
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'criterion_state_dict': criterion.state_dict(),
+                'val_loss': val_loss,
+                'val_mae_gap': val_mae_gap,
+                'val_mae_form': val_mae_form,
+                'config': CONFIG
+            }, best_model_path)
+            
+            if CONFIG["upload_to_r2"] and CONFIG["upload_best_model"]:
+                model_size_mb = os.path.getsize(best_model_path) / (1024 * 1024)
+                
+                performance_metrics = {
+                    "val_loss": val_loss,
+                    "val_mae_gap": val_mae_gap,
+                    "val_mae_form": val_mae_form,
+                    "epoch": epoch
+                }
+                
+                metadata = upload_best_model_metadata(
+                    run_dir, epoch, performance_metrics, model_size_mb
+                )
+                
+                upload_to_r2_if_enabled(
+                    best_model_path,
+                    "best_model.pt",
+                    metadata={
+                        "epoch": str(epoch),
+                        "val_loss": str(val_loss),
+                        "val_mae_gap": str(val_mae_gap),
+                        "val_mae_form": str(val_mae_form),
+                        "experiment": CONFIG["experiment_name"]
+                    }
+                )
+                
+                print(f"Uploaded best model (epoch {epoch}) to R2 Cloud Storage")
+        
+        epoch_time = time.time() - start_time
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        log_entry = (
+            f"Epoch {epoch}/{CONFIG['epochs']} | "
+            f"Time: {epoch_time:.1f}s | "
+            f"Train Loss: {total_loss/len(train_loader):.4f} | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Val MAE (Gap): {val_mae_gap:.4f} | "
+            f"Val MAE (Form): {val_mae_form:.4f} | "
+            f"LR: {current_lr:.2e}"
+        )
+        print(log_entry)
+        
+        with open(log_file, 'a') as f:
+            f.write(log_entry + '\n')
+        
+        training_history["epoch"].append(epoch)
+        training_history["train_loss"].append(total_loss/len(train_loader))
+        training_history["val_loss"].append(val_loss)
+        training_history["val_mae_gap"].append(val_mae_gap)
+        training_history["val_mae_form"].append(val_mae_form)
+        training_history["lr"].append(current_lr)
+        
+        if epoch % 5 == 0:
+            plt.figure(figsize=(12, 5))
+            
+            plt.subplot(1, 2, 1)
+            plt.plot(training_history["epoch"], training_history["train_loss"], label="Train Loss")
+            plt.plot(training_history["epoch"], training_history["val_loss"], label="Val Loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.title("Training Progress")
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(training_history["epoch"], training_history["val_mae_gap"], label="Gap MAE")
+            plt.plot(training_history["epoch"], training_history["val_mae_form"], label="Formation MAE")
+            plt.xlabel("Epoch")
+            plt.ylabel("MAE")
+            plt.legend()
+            plt.title("Validation MAE")
+            
+            plt.tight_layout()
+            plot_path = os.path.join(run_dir, f"training_progress_epoch_{epoch}.png")
+            plt.savefig(plot_path)
+            plt.close()
+            
+            if CONFIG["upload_to_r2"]:
+                upload_to_r2_if_enabled(
+                    plot_path,
+                    f"plots/training_progress_epoch_{epoch}.png"
+                )
+    
+    print("\n" + "="*60)
+    print("Evaluating best model on test set...")
+    print("="*60)
+    
+    checkpoint = torch.load(best_model_path, weights_only=True)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    test_loss, test_mae_gap, test_mae_form = evaluate_model(
+        model, test_loader, criterion, device, len(test_dataset), "Test"
+    )
+    
+    best_performance.update({
+        "test_loss": test_loss,
+        "test_mae_gap": test_mae_gap,
+        "test_mae_form": test_mae_form
+    })
+    
+    with open(log_file, 'a') as f:
+        f.write(f"\n" + "="*60 + "\n")
+        f.write(f"Final Test Results:\n")
+        f.write(f"  Best Model Epoch: {best_epoch}\n")
+        f.write(f"  Test Loss: {test_loss:.4f}\n")
+        f.write(f"  Test MAE (Band Gap): {test_mae_gap:.4f} eV\n")
+        f.write(f"  Test MAE (Formation Energy): {test_mae_form:.4f} eV/atom\n")
+        f.write("="*60 + "\n")
+    
+    print(f"\nFinal Test Results:")
+    print(f"  Best Model Epoch: {best_epoch}")
+    print(f"  Test Loss: {test_loss:.4f}")
+    print(f"  Test MAE (Band Gap): {test_mae_gap:.4f} eV")
+    print(f"  Test MAE (Formation Energy): {test_mae_form:.4f} eV/atom")
+    print("="*60)
+    
+    final_model_path = os.path.join(run_dir, "final_model.pt")
+    torch.save(model.state_dict(), final_model_path)
+    
+    history_csv_path = os.path.join(run_dir, "training_history.csv")
+    pd.DataFrame(training_history).to_csv(history_csv_path, index=False)
+    
+    if CONFIG["upload_to_r2"]:
+        if CONFIG["upload_final_model"]:
+            upload_to_r2_if_enabled(
+                final_model_path,
+                "final_model.pt",
+                metadata={
+                    "final_epoch": str(CONFIG["epochs"]),
+                    "test_loss": str(test_loss),
+                    "test_mae_gap": str(test_mae_gap),
+                    "test_mae_form": str(test_mae_form)
+                }
+            )
+        
+        if CONFIG["upload_training_history"]:
+            upload_to_r2_if_enabled(
+                history_csv_path,
+                "training_history.csv"
+            )
+        
+        summary = {
+            "experiment_name": CONFIG["experiment_name"],
+            "training_completed": datetime.now().isoformat(),
+            "best_epoch": best_epoch,
+            "best_performance": best_performance,
+            "final_performance": {
+                "test_loss": test_loss,
+                "test_mae_gap": test_mae_gap,
+                "test_mae_form": test_mae_form
+            },
+            "config_summary": {
+                "model_dim": CONFIG["dim"],
+                "n_interactions": CONFIG["n_interactions"],
+                "epochs": CONFIG["epochs"],
+                "batch_size": CONFIG["batch_size"]
+            }
+        }
+        
+        summary_path = os.path.join(run_dir, "experiment_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        upload_to_r2_if_enabled(
+            summary_path,
+            "experiment_summary.json"
+        )
+        
+        if r2_manager.is_connected():
+            prefix = f"models/{CONFIG['experiment_name']}/"
+            uploaded_files = r2_manager.list_files(prefix)
+            if uploaded_files:
+                print(f"\nFiles uploaded to R2 for {CONFIG['experiment_name']}:")
+                for file in uploaded_files:
+                    print(f"  {file}")
+                
+                best_model_r2_path = f"models/{CONFIG['experiment_name']}/best_model.pt"
+                public_url = r2_manager.generate_public_url(best_model_r2_path, expiration=604800)
+                if public_url:
+                    print(f"\nBest Model Public URL (valid 1 week):")
+                    print(f"  {public_url}")
+    
+    print(f"\nTraining completed. Results saved to: {run_dir}")
+    
+    return {
+        "run_dir": run_dir,
+        "best_epoch": best_epoch,
+        "best_performance": best_performance,
+        "test_performance": {
+            "loss": test_loss,
+            "mae_gap": test_mae_gap,
+            "mae_form": test_mae_form
+        }
+    }
+
+if __name__ == "__main__":
+    results = train_model()
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE - SUMMARY")
+    print("="*60)
+    print(f"Experiment: {CONFIG['experiment_name']}")
+    print(f"Best Model Epoch: {results['best_epoch']}")
+    print(f"Test MAE Band Gap: {results['test_performance']['mae_gap']:.4f} eV")
+    print(f"Test MAE Formation Energy: {results['test_performance']['mae_form']:.4f} eV/atom")
+    print(f"Local Output Directory: {results['run_dir']}")
+    
+    if CONFIG["upload_to_r2"]:
+        print(f"R2 Bucket: {R2_CONFIG['bucket_name']}")
+        print(f"R2 Path: models/{CONFIG['experiment_name']}/")
+        print(f"R2 Public URL: {R2_CONFIG['public_url']}")
+    print("="*60)
